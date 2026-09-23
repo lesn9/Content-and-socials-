@@ -312,6 +312,107 @@ PERSONAS = {
 }
 
 
+SEP = "━━━━━━━━━━━━━━━━━━━━━━"
+
+
+def dash_header(title: str, project: str) -> str:
+    return f"{title}\n\nProject: <b>{esc(project)}</b>\n\n{SEP}"
+
+
+def dash_line(label: str, value: Any) -> str:
+    v = value if value is not None and str(value).strip() and str(value) != "None" else "—"
+    return f"{label}: {esc(v)}"
+
+
+def dash_bullets(items: list[str], limit: int = 8) -> str:
+    out = []
+    for it in items[:limit]:
+        it = (it or "").strip()
+        if it:
+            out.append(f"• {esc(it)}")
+    return "\n".join(out) if out else "• —"
+
+
+def dash_questions(items: list[str], limit: int = 6) -> str:
+    out = []
+    for it in items[:limit]:
+        it = (it or "").strip().lstrip("?").strip()
+        if it:
+            out.append(f"❓ {esc(it)}")
+    return "\n".join(out) if out else "❓ —"
+
+
+def strip_md(text: str) -> str:
+    t = text or ""
+    t = t.replace("**", "").replace("__", "")
+    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)
+    t = re.sub(r"`+", "", t)
+    return t.strip()
+
+
+def parse_labeled_sections(raw: str, labels: list[str]) -> dict[str, str]:
+    """Split AI text by known ALL-CAPS or Title labels into buckets."""
+    raw = strip_md(raw)
+    if not raw:
+        return {lab: "" for lab in labels}
+    # Build regex alternation
+    alt = "|".join(re.escape(l) for l in labels)
+    parts = re.split(rf"(?im)^\s*(?:{alt})\s*:?\s*$", raw)
+    # re.split with capturing would be better
+    parts2 = re.split(rf"(?im)^\s*({alt})\s*:?\s*$", raw)
+    buckets = {lab.upper(): "" for lab in labels}
+    # parts2: [pre, LABEL, body, LABEL, body, ...]
+    i = 1
+    while i + 1 < len(parts2):
+        lab = parts2[i].strip().upper()
+        body = parts2[i + 1].strip()
+        # normalize label keys
+        for L in labels:
+            if L.upper() == lab:
+                buckets[L.upper()] = body
+                break
+        i += 2
+    if not any(buckets.values()) and raw:
+        buckets[labels[0].upper()] = raw
+    return buckets
+
+
+def bullets_from_block(block: str, limit: int = 6) -> list[str]:
+    items = []
+    for ln in (block or "").splitlines():
+        ln = ln.strip().lstrip("•-–— ").strip()
+        if ln:
+            items.append(ln)
+    if not items and block:
+        # split sentences lightly
+        for bit in re.split(r"(?<=[.!?])\s+", block.strip()):
+            if bit.strip():
+                items.append(bit.strip())
+    return items[:limit]
+
+
+def copyable(text: str) -> str:
+    return f"<code>{esc(strip_md(text))}</code>" if text else "<code>—</code>"
+
+
+def user_limitations(social: dict[str, Any], ai_ok: bool) -> list[str]:
+    lim = []
+    x = social.get("x") or {}
+    tg = social.get("telegram") or {}
+    web = social.get("website") or {}
+    if x.get("followers") is None and x.get("following") is None:
+        lim.append("Live X metrics unavailable.")
+    if tg.get("members") is None and not (tg.get("title") or tg.get("about")):
+        lim.append("Telegram public data limited.")
+    if not (web.get("ok") or web.get("title") or web.get("about")):
+        lim.append("Website details limited.")
+    if not ai_ok:
+        lim.append("AI analysis unavailable.")
+    return lim
+
+
+
+
 def clean_ai_html(text: str) -> str:
     """Turn messy markdown-ish AI output into clean Telegram HTML blocks."""
     if not text:
@@ -553,6 +654,11 @@ async def llm_write(prompt: str, system: str | None = None) -> str:
     if not any([groq, ork, gem, xai, oai]):
         KEY_STATUS["env"] = "NO_KEYS_VISIBLE — check this service Variables, not Scout"
     return ""
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Developer diagnostics — not shown inside intelligence reports."""
+    await cmd_status(update, context)
 
 
 async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1412,23 +1518,17 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: /social <website|@x|t.me/…|CA>"
-        )
+        await update.effective_message.reply_text("Usage: /social <website|@x|t.me/…|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
         await update.effective_message.reply_text("Could not resolve that link/CA.")
         return
-    await update.effective_message.reply_text("Gathering public signals…")
+    await update.effective_message.reply_text("Collecting public signals…")
     db, client = deps(context)
     social = await gather_social(client, p)
-    # Persist discovered links back onto project
     disc = social.get("discovered_links") or {}
-    updates: dict[str, Any] = {
-        "social_json": json.dumps(social),
-        "last_social_at": now(),
-    }
+    updates: dict[str, Any] = {"social_json": json.dumps(social), "last_social_at": now()}
     if disc.get("website") and not p.get("website"):
         updates["website"] = disc["website"]
     if disc.get("telegram") and not p.get("telegram"):
@@ -1440,43 +1540,197 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     x = social.get("x") or {}
     tg = social.get("telegram") or {}
     web = social.get("website") or {}
+    name = p.get("name") or x.get("handle") or "Project"
 
-    blocks = [
-        f"🐦 <b>SOCIAL · {esc(p.get('name') or '')}</b>  <i>#{p['id']}</i>",
-        "",
-        "<b>X</b>",
-        f"@{esc(x.get('handle') or p.get('x_handle') or '—')}",
-        f"Followers  {esc(x.get('followers') if x.get('followers') is not None else '—')}   ·   Following  {esc(x.get('following') if x.get('following') is not None else '—')}",
-        f"Posts  {esc(x.get('posts') if x.get('posts') is not None else '—')}",
-        f"Bio  {esc((x.get('bio') or '—')[:280])}",
-        "",
-        "<b>Telegram</b>",
-        f"{esc(tg.get('title') or tg_url_display(tg) or '—')}",
-        f"Members  {esc(tg.get('members') if tg.get('members') is not None else '—')}",
-        f"{esc((tg.get('about') or '—')[:200])}",
-        "",
-        "<b>Website</b>",
-        f"{esc(web.get('title') or web.get('url') or p.get('website') or '—')}",
-        f"{esc((web.get('about') or '—')[:220])}",
-    ]
-    if x.get("note") and not x.get("followers"):
-        blocks.append(f"\n<i>{esc(x.get('note'))}</i>")
-
+    # ---- AI layer (runs even if X metrics missing) ----
+    ai_ok = False
+    ai_raw = ""
     prompt = (
-        project_context(p, social)
-        + "\n\nWrite a tight operator brief. Use EXACT headings on their own lines:\n"
-        "TREND\nMAIN TOPICS\nAUDIENCE\nRISKS / GAPS\nCONTENT MOVE\n"
-        "Under MAIN TOPICS use 2-4 short bullet lines starting with -. One short paragraph or line for other sections. No markdown # or **."
+        f"{project_context(p, social)}\n\n"
+        "You are building a professional Web3 intelligence brief.\n"
+        "Use ONLY the facts above. Never invent follower counts or engagement.\n"
+        "Return EXACTLY these section labels on their own lines:\n"
+        "WHAT_WE_KNOW\n"
+        "AI_ANALYSIS\n"
+        "OPEN_QUESTIONS\n"
+        "CONTENT_GAPS\n"
+        "CONTENT_IDEAS\n"
+        "TAKEAWAYS\n"
+        "Under CONTENT_GAPS use numbered items with: known / unclear / question / opportunity\n"
+        "Under CONTENT_IDEAS use numbered items with: title / format / why\n"
+        "Under OPEN_QUESTIONS one question per line.\n"
+        "Short bullets. No markdown. No emoji inside body text."
     )
-    analysis = await llm_write(prompt)
-    if analysis:
-        blocks.append("")
-        blocks.append(format_ai_brief(analysis))
+    ai_raw = await llm_write(prompt)
+    if ai_raw:
+        ai_ok = True
+    buckets = parse_labeled_sections(
+        ai_raw or "",
+        [
+            "WHAT_WE_KNOW",
+            "AI_ANALYSIS",
+            "OPEN_QUESTIONS",
+            "CONTENT_GAPS",
+            "CONTENT_IDEAS",
+            "TAKEAWAYS",
+        ],
+    )
+
+    # Facts known without AI
+    fact_bits = []
+    if x.get("bio"):
+        fact_bits.append(f"X bio: {x['bio'][:200]}")
+    if x.get("handle") or p.get("x_handle"):
+        fact_bits.append(f"X handle: @{(x.get('handle') or p.get('x_handle'))}")
+    if web.get("title"):
+        fact_bits.append(f"Website title: {web['title']}")
+    if web.get("about"):
+        fact_bits.append(f"Website: {web['about'][:180]}")
+    if tg.get("title"):
+        fact_bits.append(f"Telegram: {tg['title']}")
+    if tg.get("about"):
+        fact_bits.append(f"Telegram about: {tg['about'][:160]}")
+    if p.get("description"):
+        fact_bits.append(f"Stored note: {str(p['description'])[:160]}")
+    if disc.get("website"):
+        fact_bits.append(f"Link found: {disc['website']}")
+    if disc.get("telegram"):
+        fact_bits.append(f"Telegram link found: {disc['telegram']}")
+
+    known_ai = bullets_from_block(buckets.get("WHAT_WE_KNOW", ""))
+    analysis = bullets_from_block(buckets.get("AI_ANALYSIS", ""))
+    questions = bullets_from_block(buckets.get("OPEN_QUESTIONS", ""))
+    takeaways = bullets_from_block(buckets.get("TAKEAWAYS", ""))
+
+    blocks: list[str] = [
+        dash_header("🐦 SOCIAL INTELLIGENCE", str(name)),
+        "",
+        "🐦 <b>X</b>",
+        f"@{(esc(x.get('handle') or p.get('x_handle') or '—'))}",
+        "",
+        "📊 <b>ACCOUNT</b>",
+        dash_line("Followers", x.get("followers")),
+        dash_line("Following", x.get("following")),
+        dash_line("Posts", x.get("posts")),
+    ]
+    if x.get("followers") is None and x.get("following") is None:
+        blocks.append("\n⚠️ Live X metrics unavailable")
+
+    blocks += [
+        "",
+        "🔎 <b>WHAT WE KNOW</b>",
+        dash_bullets(fact_bits + known_ai, 10),
+        "",
+        "🧠 <b>AI ANALYSIS</b>",
+    ]
+    if ai_ok and analysis:
+        blocks.append(dash_bullets(analysis, 8))
+    elif ai_ok:
+        blocks.append(dash_bullets(["Analysis generated but unstructured — see gaps below."], 3))
     else:
-        blocks.append("")
-        blocks.append("⚠️ " + esc(_ai_fail()))
+        blocks.append("⚠️ AI analysis unavailable")
+
+    blocks += ["", "❓ <b>OPEN QUESTIONS</b>", dash_questions(questions, 6)]
+
+    # Telegram section
+    blocks += [
+        "",
+        SEP,
+        "",
+        "💬 <b>TELEGRAM</b>",
+        dash_line("Members", tg.get("members")),
+        dash_line("Title", tg.get("title")),
+        "",
+        "🔎 <b>WHAT WE KNOW</b>",
+        dash_bullets(
+            [x for x in [tg.get("about"), disc.get("telegram"), p.get("telegram")] if x],
+            5,
+        )
+        if (tg.get("about") or disc.get("telegram") or p.get("telegram"))
+        else "• —",
+    ]
+
+    # Website
+    blocks += [
+        "",
+        SEP,
+        "",
+        "🌐 <b>WEBSITE</b>",
+        dash_line("Title", web.get("title")),
+        dash_line("URL", web.get("url") or p.get("website")),
+        "",
+        "🔎 <b>PROJECT FOCUS</b>",
+        dash_bullets([web.get("about")] if web.get("about") else [], 5)
+        if web.get("about")
+        else "• —",
+    ]
+
+    # Content gaps from AI
+    blocks += ["", SEP, "", "🧩 <b>CONTENT GAPS</b>", ""]
+    gap_body = buckets.get("CONTENT_GAPS", "").strip()
+    if gap_body:
+        # keep readable, escape
+        for ln in gap_body.splitlines()[:40]:
+            ln = ln.strip()
+            if not ln:
+                blocks.append("")
+                continue
+            low = ln.lower()
+            if low.startswith("known") or "what we know" in low or low.startswith("what is known"):
+                blocks.append(f"🔎 {esc(ln)}")
+            elif "unclear" in low or "missing" in low:
+                blocks.append(f"🕳️ {esc(ln)}")
+            elif low.startswith("question") or ln.startswith("?"):
+                blocks.append(f"❓ {esc(ln.lstrip('?').strip())}")
+            elif "opportunity" in low or low.startswith("content"):
+                blocks.append(f"💡 {esc(ln)}")
+            elif re.match(r"^\d+[.)]", ln):
+                blocks.append(f"\n<b>{esc(ln)}</b>")
+            else:
+                blocks.append(esc(ln))
+    else:
+        blocks.append("• —" if ai_ok else "⚠️ AI analysis unavailable")
+
+    # Ideas
+    blocks += ["", SEP, "", "✍️ <b>CONTENT IDEAS</b>", ""]
+    ideas_body = buckets.get("CONTENT_IDEAS", "").strip()
+    if ideas_body:
+        for ln in ideas_body.splitlines()[:35]:
+            ln = ln.strip()
+            if not ln:
+                continue
+            if re.match(r"^\d+[.)]", ln):
+                blocks.append(f"\n<b>{esc(ln)}</b>")
+            elif low_starts_why(ln):
+                blocks.append(f"Why: {esc(re.sub(r'(?i)^why:\\s*', '', ln))}")
+            elif low_starts_format(ln):
+                blocks.append(f"Format: {esc(re.sub(r'(?i)^format:\\s*', '', ln))}")
+            elif low_starts_title(ln):
+                blocks.append(f"Title: {esc(re.sub(r'(?i)^title:\\s*', '', ln))}")
+            else:
+                blocks.append(esc(ln))
+    else:
+        blocks.append("• —" if ai_ok else "⚠️ AI analysis unavailable")
+
+    blocks += [
+        "",
+        SEP,
+        "",
+        "🎯 <b>KEY TAKEAWAYS</b>",
+        dash_bullets(takeaways, 5) if takeaways else "• —",
+    ]
+
+    lim = user_limitations(social, ai_ok)
+    if lim:
+        blocks += ["", SEP, "", "⚠️ <b>DATA LIMITATIONS</b>"]
+        for L in lim:
+            blocks.append(f"• {esc(L)}")
 
     text = "\n".join(blocks)
+    # Telegram hard limit ~4096
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n…\n<i>Truncated — use /contentgaps or /ideas for detail</i>"
+
     await update.effective_message.reply_html(
         text,
         disable_web_page_preview=True,
@@ -1484,95 +1738,70 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-def tg_url_display(tg: dict[str, Any]) -> str:
-    return str(tg.get("url") or "")
+def low_starts_why(s: str) -> bool:
+    return s.lower().startswith("why")
 
 
-def format_ai_brief(raw: str) -> str:
-    """Parse TREND / MAIN TOPICS / ... into clean HTML sections."""
-    raw = raw.replace("**", "").replace("__", "")
-    raw = re.sub(r"(?m)^\s*#+\s*", "", raw)
-    sections = {
-        "TREND": "",
-        "MAIN TOPICS": "",
-        "AUDIENCE": "",
-        "RISKS / GAPS": "",
-        "CONTENT MOVE": "",
-    }
-    # Also accept alternate names
-    aliases = {
-        "AUDIENCE REACTION": "AUDIENCE",
-        "ATTENTION": "RISKS / GAPS",
-        "CONTENT OPPORTUNITY": "CONTENT MOVE",
-        "RISKS": "RISKS / GAPS",
-        "GAPS": "RISKS / GAPS",
-    }
-    current = None
-    buckets: dict[str, list[str]] = {k: [] for k in sections}
-    for line in raw.splitlines():
-        up = line.strip().upper().rstrip(":")
-        up_clean = re.sub(r"[^A-Z /]", "", up)
-        if up_clean in sections:
-            current = up_clean
-            continue
-        if up_clean in aliases:
-            current = aliases[up_clean]
-            continue
-        if current and line.strip():
-            buckets[current].append(line.strip().lstrip("-• ").strip())
-    parts = []
-    labels = [
-        ("TREND", "📈 Trend"),
-        ("MAIN TOPICS", "🏷 Topics"),
-        ("AUDIENCE", "👥 Audience"),
-        ("RISKS / GAPS", "⚠️ Gaps"),
-        ("CONTENT MOVE", "✍️ Content move"),
-    ]
-    for key, title in labels:
-        items = buckets.get(key) or []
-        if not items:
-            continue
-        parts.append(f"<b>{title}</b>")
-        if key == "MAIN TOPICS":
-            for it in items[:5]:
-                parts.append(f"• {esc(it)}")
-        else:
-            parts.append(esc(" ".join(items)[:500]))
-        parts.append("")
-    return "\n".join(parts).strip()
+def low_starts_format(s: str) -> bool:
+    return s.lower().startswith("format")
+
+
+def low_starts_title(s: str) -> bool:
+    return s.lower().startswith("title")
 
 
 
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
-    args = context.args or []
+    args = list(context.args or [])
     if not args:
         await update.effective_message.reply_text("Usage: /activity <website|@x|tg|CA> [24h|7d|30d]")
         return
     window = "7d"
     if args[-1] in {"24h", "7d", "30d"}:
-        window = args[-1]
-        q = " ".join(args[:-1])
-    else:
-        q = " ".join(args)
-    p = await resolve_project(update, context, q)
+        window = args.pop()
+    p = await resolve_project(update, context, " ".join(args))
     if not p:
-        await update.effective_message.reply_text("Not found.")
+        await update.effective_message.reply_text("Could not resolve.")
         return
     db, client = deps(context)
     social = await gather_social(client, p)
     await db.save_snapshot(p["id"], f"activity_{window}", social)
-    text = (
-        f"📊 <b>ACTIVITY · {esc(window)}</b>\n"
-        f"{esc(p['name'])}\n\n"
-        f"V1 stores snapshots each time you run this.\n"
-        f"X followers now: {esc((social.get('x') or {}).get('followers') or '—')}\n"
-        f"TG members now: {esc((social.get('telegram') or {}).get('members') or '—')}\n"
-        f"Site ok: {esc((social.get('website') or {}).get('ok'))}\n\n"
-        "Historical comparison improves as you re-run /activity over days (V2 charts)."
+    x = social.get("x") or {}
+    tg = social.get("telegram") or {}
+    ai = await llm_write(
+        project_context(p, social)
+        + f"\n\nPeriod: {window}\nLabel AI_SUMMARY\n3 bullets on activity implications from available facts only. No invented metrics."
     )
-    await update.effective_message.reply_html(text)
+    summary = bullets_from_block(parse_labeled_sections(ai or "", ["AI_SUMMARY"]).get("AI_SUMMARY", "") or (ai or ""))
+    blocks = [
+        dash_header("📊 SOCIAL ACTIVITY", str(p.get("name") or "")),
+        f"Period: {esc(window)}",
+        "",
+        "🐦 <b>X</b>",
+        dash_line("Followers", x.get("followers")),
+        dash_line("Following", x.get("following")),
+        dash_line("Posts", x.get("posts")),
+        "Posting: —",
+        "Engagement: —",
+        "Follower change: —",
+        "",
+        "💬 <b>TELEGRAM</b>",
+        dash_line("Members", tg.get("members")),
+        "Activity: —",
+        "",
+        "🧠 <b>AI SUMMARY</b>",
+        dash_bullets(summary, 5) if summary else "⚠️ AI analysis unavailable",
+        "",
+        "⚠️ <b>DATA LIMITATIONS</b>",
+        "• Historical engagement requires repeated snapshots over time.",
+        "• Live X metrics unavailable." if x.get("followers") is None else "• Snapshot stored for future comparison.",
+    ]
+    await update.effective_message.reply_html(
+        "\n".join(blocks), disable_web_page_preview=True, reply_markup=project_nav_keyboard(int(p["id"]))
+    )
+
 
 
 async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1605,7 +1834,7 @@ async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     out = await llm_write(prompt)
     body = format_ideas_clean(out) if out else esc(_ai_fail())
     await update.effective_message.reply_html(
-        f"💡 <b>IDEAS · {esc(p.get('name') or '')}</b> · <i>{esc(persona)}</i>\n\n{body}",
+        f"💡 <b>CONTENT IDEAS</b>\n\nProject: <b>{esc(p.get('name') or '')}</b>\nPersona: {esc(persona)}\n\n{SEP}\n\n{body}",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1667,27 +1896,43 @@ async def generate_write(p: dict[str, Any], kind: str, persona: str, context: Co
         f"{project_context(p, social)}\n\n"
         f"Persona: {persona}\n{voice}\n"
         f"Format: {kind}\nVariation seed: {seed}\n\n"
-        "Write ONE ready-to-post piece. Sound human and specific to THIS project. "
-        "No generic crypto hype. No hashtag spam. Do not invent product claims.\n"
-        "Also add a second alternate version under the heading ALTERNATE "
-        "so the user can pick."
+        "Return EXACTLY:\n"
+        "POST\n"
+        "(the full copy-ready post or thread only — no emoji section markers)\n"
+        "ALTERNATE\n"
+        "(second full version)\n"
+        "WHY\n"
+        "(3 short bullets on strategy)\n"
+        "No hashtag spam. Do not invent product claims."
     )
     out = await llm_write(prompt)
     if not out:
-        return f"✍️ <b>Write failed</b>\n{_ai_fail()}"
-    out = out.replace("**", "")
-    parts = out.split("ALTERNATE")
-    primary = parts[0].strip()
-    alt = parts[1].strip() if len(parts) > 1 else ""
-    body = [
-        f"✍️ <b>{esc(kind.upper())}</b> · {esc(persona)} · {esc(p.get('name') or '')}",
+        return (
+            f"✍️ <b>WRITE</b>\n\nProject: <b>{esc(p.get('name') or '')}</b>\n\n"
+            f"⚠️ AI analysis unavailable"
+        )
+    buckets = parse_labeled_sections(out, ["POST", "ALTERNATE", "WHY"])
+    post = buckets.get("POST", "").strip() or strip_md(out).split("ALTERNATE")[0].strip()
+    alt = buckets.get("ALTERNATE", "").strip()
+    why = bullets_from_block(buckets.get("WHY", ""))
+    parts = [
+        f"✍️ <b>{esc(kind.upper())}</b>",
+        f"Project: <b>{esc(p.get('name') or '')}</b>",
+        f"Persona: {esc(persona)}",
         "",
-        f"<code>{esc(primary[:3500])}</code>",
+        SEP,
+        "",
+        "✍️ <b>COPY</b>",
+        "",
+        copyable(post[:3500]),
     ]
     if alt:
-        body += ["", "<b>Alternate</b>", f"<code>{esc(alt[:2000])}</code>"]
-    body += ["", "Tap 🔀 Shuffle for a fresh take · Personas to change voice"]
-    return "\n".join(body)
+        parts += ["", "✨ <b>ALTERNATE</b>", "", copyable(alt[:2500])]
+    if why:
+        parts += ["", "🔎 <b>WHY THIS WORKS</b>", dash_bullets(why, 5)]
+    parts += ["", "Tap Shuffle for another take · Personas to change voice"]
+    return "\n".join(parts)
+
 
 
 def write_nav_keyboard(pid: int, kind: str, persona: str) -> InlineKeyboardMarkup:
@@ -1779,29 +2024,52 @@ async def cmd_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_contentgaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
-    if not context.args:
+    args = list(context.args or [])
+    if not args:
         await update.effective_message.reply_text("Usage: /contentgaps <website|@x|tg|CA>")
         return
-    p = await resolve_project(update, context, " ".join(context.args))
+    p = await resolve_project(update, context, " ".join(args))
     if not p:
-        await update.effective_message.reply_text("Not found.")
+        await update.effective_message.reply_text("Could not resolve.")
         return
     _, client = deps(context)
     social = await gather_social(client, p)
     await update.effective_message.reply_text("Analyzing gaps…")
     prompt = (
         f"{project_context(p, social)}\n\n"
-        "Identify CONTENT GAPS useful for a community/social operator pitching help:\n"
-        "1) What the project seems to talk about\n"
-        "2) What audience likely still asks (from thin docs / about text)\n"
-        "3) Missing educational / onboarding / FAQ content\n"
-        "4) 3 concrete post ideas that close those gaps\n"
-        "Be honest when data is thin."
+        "Evidence-based content gaps only. Labels:\n"
+        "KNOWN\nUNCLEAR\nQUESTIONS\nOPPORTUNITIES\n"
+        "For OPPORTUNITIES each item: title / why (tied to a gap). No generic advice. No emoji in body."
     )
     out = await llm_write(prompt)
+    buckets = parse_labeled_sections(out or "", ["KNOWN", "UNCLEAR", "QUESTIONS", "OPPORTUNITIES"])
+    blocks = [
+        dash_header("🧩 CONTENT GAPS", str(p.get("name") or "")),
+        "",
+        "🔎 <b>WHAT WE KNOW</b>",
+        dash_bullets(bullets_from_block(buckets.get("KNOWN", "")), 8),
+        "",
+        "🕳️ <b>WHAT IS UNCLEAR</b>",
+        dash_bullets(bullets_from_block(buckets.get("UNCLEAR", "")), 8),
+        "",
+        "❓ <b>QUESTIONS</b>",
+        dash_questions(bullets_from_block(buckets.get("QUESTIONS", "")), 8),
+        "",
+        "💡 <b>CONTENT OPPORTUNITIES</b>",
+        dash_bullets(bullets_from_block(buckets.get("OPPORTUNITIES", "")), 8),
+    ]
+    if not out:
+        blocks = [
+            dash_header("🧩 CONTENT GAPS", str(p.get("name") or "")),
+            "",
+            "⚠️ AI analysis unavailable",
+        ]
     await update.effective_message.reply_html(
-        f"🧩 <b>CONTENT GAPS · {esc(p['name'])}</b>\n\n{esc(out or 'AI offline')}"
+        "\n".join(blocks),
+        disable_web_page_preview=True,
+        reply_markup=project_nav_keyboard(int(p["id"])),
     )
+
 
 
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2351,6 +2619,8 @@ def main() -> None:
         ("calendar", cmd_calendar),
         ("repurpose", cmd_repurpose),
         ("testai", cmd_testai),
+        ("debug", cmd_debug),
+        ("settings", cmd_status),
     ]
     cmds.extend(v2)
     for name, fn in cmds:
