@@ -97,7 +97,9 @@ Same pattern for:
 /projects — saved list
 /watch · /watchlist
 
-<b>V2 intelligence</b>
+<b>V3</b> · personas · shuffle · cleaner briefs · link mining from X bio
+
+<b>Intelligence</b>
 /audience · /narratives · /topcontent · /contentpatterns
 /mentions · /weekly · /calendar · /repurpose
 
@@ -106,6 +108,8 @@ Same pattern for:
 
 Works with website, X, TG, or CA — any one is enough.
 If AI fails: /testai shows the exact provider error.
+X counts need a working bearer OR public mirrors; AI cannot invent live follower numbers.
+How-to: developer.x.com → Project → App → Keys → Bearer Token (Read).
 """
 
 # ---------- DB ----------
@@ -298,6 +302,120 @@ class DB:
 
 KEY_STATUS: dict[str, str] = {}
 
+PERSONAS = {
+    "founder": "Founder voice: direct, first-person, product-focused, short sentences, minimal hype.",
+    "community": "Community manager: warm, inclusive, asks questions, lightly playful, no corporate fluff.",
+    "educator": "Educator: clear analogies, step-by-step, patient, zero jargon unless explained.",
+    "analyst": "Market-aware analyst: precise, cautious claims, structured, no shill language.",
+    "degen": "Crypto-native degen: punchy, meme-literate, still accurate — not fake slang spam.",
+    "minimal": "Minimalist: fewest words possible, high signal, no emojis unless necessary.",
+}
+
+
+def clean_ai_html(text: str) -> str:
+    """Turn messy markdown-ish AI output into clean Telegram HTML blocks."""
+    if not text:
+        return ""
+    t = text.strip()
+    # strip bold markdown leftovers carefully
+    t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"__([^_]+)__", r"<b>\1</b>", t)
+    t = re.sub(r"(?m)^\s*#{1,3}\s*", "", t)
+    t = re.sub(r"(?m)^\s*[-•]\s+", "• ", t)
+    # collapse excess blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return esc(t) if "<b>" not in t else t  # if we added tags, don't double-esc whole thing
+
+
+def format_section(title: str, body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        return f"<b>{esc(title)}</b>\n—"
+    # if body already has html from clean, use as-is after light pass
+    lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if line.startswith("•") or line.startswith("-"):
+            lines.append("• " + esc(line.lstrip("•- ").strip()))
+        elif line.isupper() and len(line) < 40:
+            lines.append(f"<b>{esc(line.title())}</b>")
+        else:
+            lines.append(esc(line))
+    return f"<b>{esc(title)}</b>\n" + "\n".join(lines)
+
+
+def extract_links_from_text(blob: str) -> dict[str, str | None]:
+    """Pull website / telegram / discord from bio or page text."""
+    out: dict[str, str | None] = {"website": None, "telegram": None, "discord": None}
+    if not blob:
+        return out
+    # t.me
+    m = re.search(r"https?://t\.me/[A-Za-z0-9_]+", blob)
+    if m:
+        out["telegram"] = m.group(0)
+    # discord
+    m = re.search(r"https?://(discord\.gg|discord\.com/invite)/[A-Za-z0-9-]+", blob, re.I)
+    if m:
+        out["discord"] = m.group(0)
+    # generic urls skip x.com twitter t.co for website preference
+    for m in re.finditer(r"https?://[^\s<>\"']+", blob):
+        u = m.group(0).rstrip(").,]")
+        low = u.lower()
+        if any(x in low for x in ("x.com/", "twitter.com/", "t.me/", "discord.", "t.co/")):
+            continue
+        if not out["website"]:
+            out["website"] = u
+    return out
+
+
+def project_nav_keyboard(pid: int, extra: list[list] | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = extra[:] if extra else []
+    rows.append(
+        [
+            InlineKeyboardButton("🐦 Social", callback_data=f"soc:{pid}"),
+            InlineKeyboardButton("💡 Ideas", callback_data=f"id:{pid}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("✍️ Write", callback_data=f"wr:{pid}"),
+            InlineKeyboardButton("🔀 Shuffle write", callback_data=f"shw:{pid}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🧩 Gaps", callback_data=f"gap:{pid}"),
+            InlineKeyboardButton("📅 Calendar", callback_data=f"cal:{pid}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("👤 Personas", callback_data=f"per:{pid}"),
+            InlineKeyboardButton("⭐ Watch", callback_data=f"wa:{pid}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def persona_keyboard(pid: int) -> InlineKeyboardMarkup:
+    rows = []
+    keys = list(PERSONAS.keys())
+    for i in range(0, len(keys), 2):
+        chunk = keys[i : i + 2]
+        rows.append(
+            [
+                InlineKeyboardButton(k.title(), callback_data=f"pw:{pid}:{k}")
+                for k in chunk
+            ]
+        )
+    rows.append([InlineKeyboardButton("« Back", callback_data=f"p:{pid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+
 
 async def llm_write(prompt: str, system: str | None = None) -> str:
     """Free-first: Groq → OpenRouter → Gemini → xAI/OpenAI. Stores errors in KEY_STATUS."""
@@ -318,9 +436,9 @@ async def llm_write(prompt: str, system: str | None = None) -> str:
     if groq:
         for model in (
             "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
             "llama-3.1-8b-instant",
-            "gemma2-9b-it",
         ):
             attempts.append(("groq", groq, "https://api.groq.com/openai/v1/chat/completions", model))
     if ork:
@@ -717,65 +835,189 @@ async def fetch_x_brief(client: httpx.AsyncClient, handle: str | None) -> dict[s
     out["handle"] = h
     bearer = env("X_BEARER_TOKEN")
     if bearer:
-        try:
-            r = await client.get(
-                f"https://api.x.com/2/users/by/username/{h}",
-                params={"user.fields": "public_metrics,description"},
-                headers={"Authorization": f"Bearer {bearer}"},
-                timeout=20,
-            )
-            if r.status_code < 400:
+        headers = {"Authorization": f"Bearer {bearer}"}
+        last_err = None
+        for base in (
+            "https://api.x.com/2",
+            "https://api.twitter.com/2",
+        ):
+            try:
+                r = await client.get(
+                    f"{base}/users/by/username/{h}",
+                    params={"user.fields": "public_metrics,description,url,entities"},
+                    headers=headers,
+                    timeout=20,
+                )
+                if r.status_code >= 400:
+                    last_err = f"http {r.status_code}: {(r.text or '')[:100]}"
+                    continue
                 data = (r.json().get("data") or {})
                 metrics = data.get("public_metrics") or {}
                 out["followers"] = metrics.get("followers_count")
                 out["following"] = metrics.get("following_count")
                 out["posts"] = metrics.get("tweet_count")
                 out["bio"] = data.get("description")
+                # entities.url may hold expanded website
+                ents = data.get("entities") or {}
+                url_ents = (ents.get("url") or {}).get("urls") or []
+                desc_ents = (ents.get("description") or {}).get("urls") or []
+                for u in url_ents + desc_ents:
+                    exp = u.get("expanded_url") or u.get("url")
+                    if exp:
+                        out["bio"] = (out.get("bio") or "") + " " + exp
                 out["ok"] = True
                 return out
-            out["note"] = f"X API http {r.status_code}"
-        except Exception as e:
-            out["note"] = str(e)[:100]
+            except Exception as e:
+                last_err = str(e)[:100]
+        out["note"] = last_err or "X API failed"
 
-    # Public HTML fallback (fragile, best-effort)
-    try:
-        html = await http_get(
-            client,
-            f"https://x.com/{h}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; SocialContentBot/2.0)",
-                "Accept": "text/html",
-            },
-        )
-        if isinstance(html, str) and len(html) > 500:
-            # og:description often has bio
+        # Public fallbacks (no official API) — best-effort only
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/json",
+    }
+    pages = [
+        f"https://x.com/{h}",
+        f"https://nitter.net/{h}",
+        f"https://nitter.privacydev.net/{h}",
+    ]
+    for url in pages:
+        try:
+            html = await http_get(client, url, headers=headers)
+            if not isinstance(html, str) or len(html) < 200:
+                continue
+            # bio / og description
             m = re.search(
-                r'property="og:description"\s+content="([^"]+)"', html
-            ) or re.search(r'content="([^"]+)"\s+property="og:description"', html)
-            if m:
-                out["bio"] = m.group(1)[:300]
+                r'property="og:description"\s+content="([^"]+)"', html, re.I
+            ) or re.search(
+                r'content="([^"]+)"\s+property="og:description"', html, re.I
+            )
+            if m and not out.get("bio"):
+                out["bio"] = html_unescape(m.group(1))[:400]
+            # nitter profile stats often as plain text
+            m_f = re.search(
+                r'([\d,\.]+[KMB]?)\s*Followers', html, re.I
+            ) or re.search(
+                r'followers["\s:]+([\d,]+)', html, re.I
+            )
+            if m_f and out.get("followers") is None:
+                out["followers"] = parse_count(m_f.group(1))
+            m_g = re.search(
+                r'([\d,\.]+[KMB]?)\s*Following', html, re.I
+            )
+            if m_g and out.get("following") is None:
+                out["following"] = parse_count(m_g.group(1))
+            m_p = re.search(
+                r'([\d,\.]+[KMB]?)\s*Posts', html, re.I
+            ) or re.search(
+                r'([\d,\.]+[KMB]?)\s*Tweets', html, re.I
+            )
+            if m_p and out.get("posts") is None:
+                out["posts"] = parse_count(m_p.group(1))
+            if out.get("bio") or out.get("followers") is not None:
                 out["ok"] = True
-            m2 = re.search(r'"description":"([^"]{10,200})"', html)
-            if m2 and not out.get("bio"):
-                out["bio"] = m2.group(1).encode().decode("unicode_escape", errors="ignore")[:300]
-                out["ok"] = True
-            if not out.get("note"):
-                out["note"] = "Public page fallback (limited without X_BEARER_TOKEN)"
-    except Exception as e:
-        out["note"] = (out.get("note") or "") + f" scrape:{str(e)[:60]}"
-    if not out["ok"] and not out.get("note"):
-        out["note"] = "X data limited without X_BEARER_TOKEN"
+                out["note"] = f"Public source: {url.split('/')[2]}"
+                break
+        except Exception as e:
+            out["note"] = f"scrape: {str(e)[:80]}"
+    if not out.get("ok") and not out.get("note"):
+        out["note"] = "No live X metrics — API token limited; public mirrors also blocked"
     return out
 
 
+def html_unescape(s: str) -> str:
+    import html as _html
+    return _html.unescape(s or "")
+
+
+def copy_block(text: str) -> str:
+    """Telegram-copyable monospace block."""
+    t = (text or "").strip()
+    if not t:
+        return "<code>—</code>"
+    return f"<code>{esc(t)}</code>"
+
+
+def format_ideas_clean(raw: str) -> str:
+    """6 ideas → numbered clean copyable cards."""
+    if not raw:
+        return "—"
+    t = raw.replace("**", "").replace("__", "")
+    t = re.sub(r"(?m)^\s*#{1,3}\s*", "", t)
+    # split on numbered items
+    parts = re.split(r"(?m)^\s*(?:\d+[.)]|#{1,3}\s*\d+[.)]?)\s*", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) <= 1:
+        return copy_block(t[:3500])
+    out = []
+    for i, p in enumerate(parts[:8], 1):
+        lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
+        title = lines[0] if lines else f"Idea {i}"
+        title = re.sub(r"^[Tt]itle:\s*", "", title)
+        title = title.strip('"')
+        rest = "\n".join(lines[1:]) if len(lines) > 1 else ""
+        out.append(f"<b>{i}.</b> {esc(title)}")
+        if rest:
+            out.append(copy_block(rest[:800]))
+        out.append("")
+    return "\n".join(out)
+
+
+def parse_count(raw: str) -> int | None:
+    if not raw:
+        return None
+    t = str(raw).strip().upper().replace(",", "")
+    mult = 1
+    if t.endswith("K"):
+        mult = 1_000
+        t = t[:-1]
+    elif t.endswith("M"):
+        mult = 1_000_000
+        t = t[:-1]
+    elif t.endswith("B"):
+        mult = 1_000_000_000
+        t = t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return None
+
+
 async def gather_social(client: httpx.AsyncClient, p: dict[str, Any]) -> dict[str, Any]:
-    website = await fetch_website_brief(client, p.get("website"))
-    tg = await fetch_tg_brief(client, normalize_tg(p.get("telegram")))
+    """Pull X first, mine bio for TG/website, then fetch those pages."""
     x = await fetch_x_brief(client, p.get("x_handle") or p.get("twitter"))
+    website_url = p.get("website")
+    tg_url = normalize_tg(p.get("telegram"))
+    # Mine bio + note for links
+    blob = " ".join(
+        str(x.get(k) or "") for k in ("bio", "note")
+    )
+    found = extract_links_from_text(blob)
+    if not website_url and found.get("website"):
+        website_url = found["website"]
+    if not tg_url and found.get("telegram"):
+        tg_url = found["telegram"]
+    website = await fetch_website_brief(client, website_url)
+    # Site may also list telegram
+    site_blob = " ".join(
+        str((website or {}).get(k) or "") for k in ("about", "title", "url")
+    )
+    found2 = extract_links_from_text(site_blob + " " + str((website or {}).get("about") or ""))
+    if not tg_url and found2.get("telegram"):
+        tg_url = found2["telegram"]
+    tg = await fetch_tg_brief(client, tg_url)
     return {
         "website": website,
         "telegram": tg,
         "x": x,
+        "discovered_links": {
+            "website": website_url,
+            "telegram": tg_url,
+            "discord": found.get("discord") or found2.get("discord"),
+        },
         "gathered_at": now(),
     }
 
@@ -1170,58 +1412,135 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /social <website|@x|t.me/…|CA|chain:CA>")
+        await update.effective_message.reply_text(
+            "Usage: /social <website|@x|t.me/…|CA>"
+        )
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
         await update.effective_message.reply_text("Could not resolve that link/CA.")
         return
-    await update.effective_message.reply_text("Gathering public social signals…")
+    await update.effective_message.reply_text("Gathering public signals…")
     db, client = deps(context)
     social = await gather_social(client, p)
-    await db.update_project(p["id"], social_json=json.dumps(social), last_social_at=now())
+    # Persist discovered links back onto project
+    disc = social.get("discovered_links") or {}
+    updates: dict[str, Any] = {
+        "social_json": json.dumps(social),
+        "last_social_at": now(),
+    }
+    if disc.get("website") and not p.get("website"):
+        updates["website"] = disc["website"]
+    if disc.get("telegram") and not p.get("telegram"):
+        updates["telegram"] = disc["telegram"]
+    await db.update_project(p["id"], **updates)
     await db.save_snapshot(p["id"], "social", social)
+    p = await db.by_id(p["id"]) or p
 
     x = social.get("x") or {}
     tg = social.get("telegram") or {}
     web = social.get("website") or {}
 
-    lines = [
-        "🐦 <b>SOCIAL INTELLIGENCE</b>",
-        f"Project: <b>{esc(p['name'])}</b> (#{p['id']})",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+    blocks = [
+        f"🐦 <b>SOCIAL · {esc(p.get('name') or '')}</b>  <i>#{p['id']}</i>",
+        "",
         "<b>X</b>",
-        f"Handle: @{esc(x.get('handle') or p.get('x_handle') or '—')}",
-        f"Followers: {esc(x.get('followers') if x.get('followers') is not None else '—')}",
-        f"Following: {esc(x.get('following') if x.get('following') is not None else '—')}",
-        f"Posts: {esc(x.get('posts') if x.get('posts') is not None else '—')}",
-        f"Bio: {esc((x.get('bio') or x.get('note') or '—')[:200])}",
+        f"@{esc(x.get('handle') or p.get('x_handle') or '—')}",
+        f"Followers  {esc(x.get('followers') if x.get('followers') is not None else '—')}   ·   Following  {esc(x.get('following') if x.get('following') is not None else '—')}",
+        f"Posts  {esc(x.get('posts') if x.get('posts') is not None else '—')}",
+        f"Bio  {esc((x.get('bio') or '—')[:280])}",
         "",
         "<b>Telegram</b>",
-        f"Title: {esc(tg.get('title') or '—')}",
-        f"Members: {esc(tg.get('members') if tg.get('members') is not None else '—')}",
-        f"About: {esc((tg.get('about') or '—')[:200])}",
+        f"{esc(tg.get('title') or tg_url_display(tg) or '—')}",
+        f"Members  {esc(tg.get('members') if tg.get('members') is not None else '—')}",
+        f"{esc((tg.get('about') or '—')[:200])}",
         "",
         "<b>Website</b>",
-        f"Title: {esc(web.get('title') or '—')}",
-        f"About: {esc((web.get('about') or '—')[:220])}",
-        f"Last check: {esc(ago(social.get('gathered_at')))}",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"{esc(web.get('title') or web.get('url') or p.get('website') or '—')}",
+        f"{esc((web.get('about') or '—')[:220])}",
     ]
-    # AI layer on top of facts
+    if x.get("note") and not x.get("followers"):
+        blocks.append(f"\n<i>{esc(x.get('note'))}</i>")
+
     prompt = (
-        f"{project_context(p, social)}\n\n"
-        "Based ONLY on the facts above, write short sections:\n"
-        "TREND (1 line)\nMAIN TOPICS (up to 3 bullets)\nAUDIENCE REACTION (1-2 lines)\n"
-        "ATTENTION (gaps/unanswered risks)\nCONTENT OPPORTUNITY (1 concrete idea)\n"
-        "Label interpretation as analysis, not fact."
+        project_context(p, social)
+        + "\n\nWrite a tight operator brief. Use EXACT headings on their own lines:\n"
+        "TREND\nMAIN TOPICS\nAUDIENCE\nRISKS / GAPS\nCONTENT MOVE\n"
+        "Under MAIN TOPICS use 2-4 short bullet lines starting with -. One short paragraph or line for other sections. No markdown # or **."
     )
     analysis = await llm_write(prompt)
     if analysis:
-        lines.append(esc(analysis))
+        blocks.append("")
+        blocks.append(format_ai_brief(analysis))
     else:
-        lines.append("⚠️ " + esc(_ai_fail()))
-    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+        blocks.append("")
+        blocks.append("⚠️ " + esc(_ai_fail()))
+
+    text = "\n".join(blocks)
+    await update.effective_message.reply_html(
+        text,
+        disable_web_page_preview=True,
+        reply_markup=project_nav_keyboard(int(p["id"])),
+    )
+
+
+def tg_url_display(tg: dict[str, Any]) -> str:
+    return str(tg.get("url") or "")
+
+
+def format_ai_brief(raw: str) -> str:
+    """Parse TREND / MAIN TOPICS / ... into clean HTML sections."""
+    raw = raw.replace("**", "").replace("__", "")
+    raw = re.sub(r"(?m)^\s*#+\s*", "", raw)
+    sections = {
+        "TREND": "",
+        "MAIN TOPICS": "",
+        "AUDIENCE": "",
+        "RISKS / GAPS": "",
+        "CONTENT MOVE": "",
+    }
+    # Also accept alternate names
+    aliases = {
+        "AUDIENCE REACTION": "AUDIENCE",
+        "ATTENTION": "RISKS / GAPS",
+        "CONTENT OPPORTUNITY": "CONTENT MOVE",
+        "RISKS": "RISKS / GAPS",
+        "GAPS": "RISKS / GAPS",
+    }
+    current = None
+    buckets: dict[str, list[str]] = {k: [] for k in sections}
+    for line in raw.splitlines():
+        up = line.strip().upper().rstrip(":")
+        up_clean = re.sub(r"[^A-Z /]", "", up)
+        if up_clean in sections:
+            current = up_clean
+            continue
+        if up_clean in aliases:
+            current = aliases[up_clean]
+            continue
+        if current and line.strip():
+            buckets[current].append(line.strip().lstrip("-• ").strip())
+    parts = []
+    labels = [
+        ("TREND", "📈 Trend"),
+        ("MAIN TOPICS", "🏷 Topics"),
+        ("AUDIENCE", "👥 Audience"),
+        ("RISKS / GAPS", "⚠️ Gaps"),
+        ("CONTENT MOVE", "✍️ Content move"),
+    ]
+    for key, title in labels:
+        items = buckets.get(key) or []
+        if not items:
+            continue
+        parts.append(f"<b>{title}</b>")
+        if key == "MAIN TOPICS":
+            for it in items[:5]:
+                parts.append(f"• {esc(it)}")
+        else:
+            parts.append(esc(" ".join(items)[:500]))
+        parts.append("")
+    return "\n".join(parts).strip()
+
 
 
 async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1259,77 +1578,151 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /ideas <website|@x|tg|CA>")
+    args = list(context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            "Usage: /ideas <website|@x|CA> [persona]\nPersonas: founder community educator analyst degen minimal"
+        )
         return
-    p = await resolve_project(update, context, " ".join(context.args))
+    persona = "community"
+    if args[-1].lower() in PERSONAS:
+        persona = args.pop().lower()
+    p = await resolve_project(update, context, " ".join(args))
     if not p:
-        await update.effective_message.reply_text("Not found.")
+        await update.effective_message.reply_text("Could not resolve.")
         return
     _, client = deps(context)
     social = await gather_social(client, p)
-    await update.effective_message.reply_text("Generating ideas…")
+    await update.effective_message.reply_text(f"Ideas · {persona}…")
+    voice = PERSONAS.get(persona, PERSONAS["community"])
     prompt = (
-        f"{project_context(p, social)}\n\n"
-        "Generate 6 project-specific content opportunities. "
-        "For each: title, format (thread/short post/TG/video idea), why it fits THIS project. "
-        "No generic crypto filler. Seed "
-        f"{random.randint(1,9999)}."
+        f"{project_context(p, social)}\n\nPersona: {persona}\n{voice}\n"
+        f"Seed {random.randint(1,9999)}\n\n"
+        "Give exactly 6 content ideas. For each use this plain format:\n"
+        "1. TITLE\nFormat: thread|short post|TG|video\nAngle: one line why it fits THIS project\nDraft hook: one ready sentence\n\n"
+        "No markdown headers. No generic crypto filler."
     )
     out = await llm_write(prompt)
+    body = format_ideas_clean(out) if out else esc(_ai_fail())
     await update.effective_message.reply_html(
-        f"💡 <b>CONTENT OPPORTUNITIES · {esc(p['name'])}</b>\n\n{esc(out or 'AI offline')}",
+        f"💡 <b>IDEAS · {esc(p.get('name') or '')}</b> · <i>{esc(persona)}</i>\n\n{body}",
         disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔀 Shuffle ideas", callback_data=f"shi:{p['id']}:{persona}"
+                    ),
+                    InlineKeyboardButton("👤 Personas", callback_data=f"per:{p['id']}"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Write", callback_data=f"wr:{p['id']}"),
+                    InlineKeyboardButton("« Social", callback_data=f"soc:{p['id']}"),
+                ],
+            ]
+        ),
     )
+
 
 
 async def cmd_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
-    args = context.args or []
+    args = list(context.args or [])
     if not args:
         await update.effective_message.reply_text(
-            "Usage: /write <website|@x|tg|CA> [x|thread|tg|edu|community|announce]"
+            "Usage:\n/write <website|@x|CA> [x|thread|tg|edu|community|announce] [persona]\n"
+            "Personas: founder community educator analyst degen minimal\n"
+            "Or open Personas from the project menu."
         )
         return
     kind = "x"
-    if args[-1].lower() in {"x", "thread", "tg", "edu", "community", "announce", "reply"}:
-        kind = args[-1].lower()
-        q = " ".join(args[:-1])
-    else:
-        q = " ".join(args)
+    persona = "community"
+    # trailing tokens
+    known_kinds = {"x", "thread", "tg", "edu", "community", "announce", "reply"}
+    while args and args[-1].lower() in PERSONAS:
+        persona = args.pop().lower()
+    if args and args[-1].lower() in known_kinds:
+        kind = args.pop().lower()
+    q = " ".join(args)
     p = await resolve_project(update, context, q)
     if not p:
-        await update.effective_message.reply_text("Not found.")
+        await update.effective_message.reply_text("Could not resolve.")
         return
-    _, client = deps(context)
+    await update.effective_message.reply_text(f"Writing · {kind} · {persona}…")
+    text = await generate_write(p, kind, persona, context)
+    await update.effective_message.reply_html(
+        text,
+        disable_web_page_preview=True,
+        reply_markup=write_nav_keyboard(int(p["id"]), kind, persona),
+    )
+
+
+async def generate_write(p: dict[str, Any], kind: str, persona: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+    client = context.application.bot_data["http"]
     social = await gather_social(client, p)
-    await update.effective_message.reply_text(f"Writing ({kind})…")
+    voice = PERSONAS.get(persona) or PERSONAS["community"]
+    seed = random.randint(1000, 9999)
     prompt = (
         f"{project_context(p, social)}\n\n"
-        f"Write a ready-to-post {kind} piece for this project. "
-        "Match a professional-but-human Web3 community voice. "
-        "Do not invent product features. Include a light CTA."
+        f"Persona: {persona}\n{voice}\n"
+        f"Format: {kind}\nVariation seed: {seed}\n\n"
+        "Write ONE ready-to-post piece. Sound human and specific to THIS project. "
+        "No generic crypto hype. No hashtag spam. Do not invent product claims.\n"
+        "Also add a second alternate version under the heading ALTERNATE "
+        "so the user can pick."
     )
     out = await llm_write(prompt)
-    await update.effective_message.reply_html(
-        f"✍️ <b>WRITE · {esc(kind)} · {esc(p['name'])}</b>\n\n<code>{esc(out or 'AI offline')}</code>",
-        disable_web_page_preview=True,
+    if not out:
+        return f"✍️ <b>Write failed</b>\n{_ai_fail()}"
+    out = out.replace("**", "")
+    parts = out.split("ALTERNATE")
+    primary = parts[0].strip()
+    alt = parts[1].strip() if len(parts) > 1 else ""
+    body = [
+        f"✍️ <b>{esc(kind.upper())}</b> · {esc(persona)} · {esc(p.get('name') or '')}",
+        "",
+        f"<code>{esc(primary[:3500])}</code>",
+    ]
+    if alt:
+        body += ["", "<b>Alternate</b>", f"<code>{esc(alt[:2000])}</code>"]
+    body += ["", "Tap 🔀 Shuffle for a fresh take · Personas to change voice"]
+    return "\n".join(body)
+
+
+def write_nav_keyboard(pid: int, kind: str, persona: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔀 Shuffle", callback_data=f"shw:{pid}:{kind}:{persona}"
+                ),
+                InlineKeyboardButton("👤 Personas", callback_data=f"per:{pid}"),
+            ],
+            [
+                InlineKeyboardButton("« Social", callback_data=f"soc:{pid}"),
+                InlineKeyboardButton("💡 Ideas", callback_data=f"id:{pid}"),
+            ],
+        ]
     )
+
 
 
 async def cmd_thread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
-    args = context.args or []
+    args = list(context.args or [])
     if len(args) < 2:
-        await update.effective_message.reply_text("Usage: /thread <website|@x|CA> <topic>")
+        await update.effective_message.reply_text(
+            "Usage: /thread <website|@x|CA> <topic> [persona]"
+        )
         return
-    # first token id/name — rest topic. If id is multi-word name, user should use id.
+    persona = "community"
+    if args[-1].lower() in PERSONAS:
+        persona = args.pop().lower()
     p = await resolve_project(update, context, args[0])
     topic = " ".join(args[1:])
     if not p:
-        # try two-token name
         p = await resolve_project(update, context, " ".join(args[:2]))
         topic = " ".join(args[2:])
     if not p or not topic:
@@ -1337,17 +1730,34 @@ async def cmd_thread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     _, client = deps(context)
     social = await gather_social(client, p)
-    await update.effective_message.reply_text("Building thread…")
+    await update.effective_message.reply_text(f"Thread · {persona}…")
+    voice = PERSONAS.get(persona, PERSONAS["community"])
     prompt = (
-        f"{project_context(p, social)}\n\n"
-        f"Topic: {topic}\n\n"
-        "Write a 7-tweet X thread: Hook, Problem, Explanation, Product, Example, Why it matters, CTA. "
-        "Number them 1/7 … 7/7. Stay factual to the project context."
+        f"{project_context(p, social)}\n\nTopic: {topic}\nPersona: {persona}\n{voice}\n"
+        f"Seed {random.randint(1,9999)}\n\n"
+        "Write a 7-tweet thread. Label each line as 1/7 through 7/7. "
+        "Copy-ready. No hashtag spam. Factual to project context only."
     )
     out = await llm_write(prompt)
+    body = copy_block(out) if out else esc(_ai_fail())
     await update.effective_message.reply_html(
-        f"🧵 <b>THREAD · {esc(p['name'])}</b>\nTopic: {esc(topic)}\n\n<code>{esc(out or 'AI offline')}</code>"
+        f"🧵 <b>THREAD · {esc(p.get('name') or '')}</b> · <i>{esc(persona)}</i>\n"
+        f"Topic: {esc(topic)}\n\n{body}",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔀 Shuffle",
+                        callback_data=f"sht:{p['id']}:{persona}:{topic[:40]}",
+                    ),
+                    InlineKeyboardButton("👤 Personas", callback_data=f"per:{p['id']}"),
+                ],
+                [InlineKeyboardButton("« Back", callback_data=f"p:{p['id']}")],
+            ]
+        ),
     )
+
 
 
 async def cmd_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1592,45 +2002,85 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not await gate(update, context):
         return
-    await q.answer()
-    kind, _, rest = q.data.partition(":")
-    if not rest.isdigit():
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    data = q.data
+    parts = data.split(":")
+    kind = parts[0]
+    if len(parts) < 2 or not parts[1].isdigit():
         return
-    pid = int(rest)
+    pid = int(parts[1])
     db, client = deps(context)
     p = await db.by_id(pid)
     if not p:
-        await q.edit_message_text("Project not found.")
+        await q.edit_message_text("Project not found. Run the command again with the link.")
         return
+
     if kind == "p":
-        context.args = [str(pid)]
-        # reuse summary via message
         text = (
             f"📁 <b>#{p['id']} {esc(p['name'])}</b>\n"
-            f"🌐 {esc(p.get('website') or '—')}\n𝕏 @{esc(p.get('x_handle') or '—')}\n"
+            f"🌐 {esc(p.get('website') or '—')}\n"
+            f"𝕏 @{esc(p.get('x_handle') or '—')}\n"
             f"💬 {esc(p.get('telegram') or '—')}"
         )
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("🐦 Social", callback_data=f"soc:{pid}"),
-                    InlineKeyboardButton("💡 Ideas", callback_data=f"id:{pid}"),
-                ]
-            ]
+        await q.edit_message_text(
+            text, parse_mode="HTML", reply_markup=project_nav_keyboard(pid), disable_web_page_preview=True
         )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
     elif kind == "soc":
         context.args = [str(pid)]
+        # send as new message for long content
+        fake = update
         await cmd_social(update, context)
     elif kind == "id":
         context.args = [str(pid)]
         await cmd_ideas(update, context)
     elif kind == "wr":
-        context.args = [str(pid), "x"]
+        context.args = [str(pid), "x", "community"]
         await cmd_write(update, context)
+    elif kind == "shw":
+        knd = parts[2] if len(parts) > 2 else "x"
+        persona = parts[3] if len(parts) > 3 else "community"
+        await q.message.reply_text(f"Shuffling · {knd} · {persona}…")
+        text = await generate_write(p, knd, persona, context)
+        await q.message.reply_html(
+            text, disable_web_page_preview=True, reply_markup=write_nav_keyboard(pid, knd, persona)
+        )
+    elif kind == "per":
+        await q.edit_message_text(
+            f"👤 <b>Pick a writing persona</b>\n{esc(p.get('name') or '')}",
+            parse_mode="HTML",
+            reply_markup=persona_keyboard(pid),
+        )
+    elif kind == "pw":
+        persona = parts[2] if len(parts) > 2 else "community"
+        await q.message.reply_text(f"Writing as {persona}…")
+        text = await generate_write(p, "x", persona, context)
+        await q.message.reply_html(
+            text,
+            disable_web_page_preview=True,
+            reply_markup=write_nav_keyboard(pid, "x", persona),
+        )
+    elif kind == "gap":
+        context.args = [str(pid)]
+        await cmd_contentgaps(update, context)
+    elif kind == "cal":
+        context.args = [str(pid)]
+        await cmd_calendar(update, context)
+    elif kind == "shi":
+        persona = parts[2] if len(parts) > 2 else "community"
+        context.args = [str(pid), persona]
+        await cmd_ideas(update, context)
+    elif kind == "sht":
+        persona = parts[2] if len(parts) > 2 else "community"
+        topic = ":".join(parts[3:]) if len(parts) > 3 else "product overview"
+        context.args = [str(pid), topic, persona]
+        await cmd_thread(update, context)
     elif kind == "wa":
         await db.watch(update.effective_user.id, pid)
         await q.answer("Watching", show_alert=True)
+
 
 
 async def on_start_app(app: Application) -> None:
