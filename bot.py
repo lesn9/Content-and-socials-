@@ -74,40 +74,29 @@ def ago(ts: int | None) -> str:
 
 HELP = """🐦 <b>Social + Content Intelligence</b>
 
-Standalone bot for projects you choose to analyze.
-(Not Project Scout — add projects yourself.)
+Analyze any project from <b>one link</b> — no id required.
 
-<b>PROJECT</b>
-/addproject — guided add
-/addproject Name | @x | https://site | https://t.me/... | chain | 0xCA
-/projects — your registry
-/project &lt;id|name&gt; — summary
-/removeproject &lt;id&gt;
+<b>Just pass what you have:</b>
+/social https://x.com/handle
+/social @handle
+/social https://t.me/group
+/social https://project.xyz
+/social 0xContract…
+/social solana:TokenMint…
+/social base:0x…
 
-<b>SOCIAL</b>
-/social &lt;id|name&gt; — social dashboard
-/activity &lt;id|name&gt; [24h|7d]
-/watch &lt;id&gt; · /unwatch &lt;id&gt; · /watchlist
+Same pattern for:
+/ideas · /write · /thread · /contentgaps · /daily · /audit · /announce · /communitycontent
 
-<b>CONTENT</b>
-/ideas &lt;id|name&gt; — content opportunities
-/write &lt;id|name&gt; [x|thread|tg|edu|community|announce]
-/thread &lt;id|name&gt; &lt;topic&gt;
-/rewrite &lt;id|name&gt; — then paste text
-/contentgaps &lt;id|name&gt;
-/announce &lt;id|name&gt; &lt;what happened&gt;
-/communitycontent &lt;id|name&gt;
-/voice &lt;id|name&gt; — show/set tone notes
+<b>Optional save</b> (for watchlist / reuse):
+/addproject — save a project you care about long-term
+/projects — saved list
+/watch · /watchlist
 
-<b>REPORTS</b>
-/daily &lt;id|name&gt;
-/audit &lt;id|name&gt;
-
-<b>SYSTEM</b>
+<b>System</b>
 /status · /help
 
-AI needs <code>GROQ_API_KEY</code> or <code>OPENROUTER_API_KEY</code> on Railway.
-X deep data needs paid <code>X_BEARER_TOKEN</code> (optional).
+Works with whatever is available (X only, TG only, site only, or CA only).
 """
 
 # ---------- DB ----------
@@ -440,6 +429,150 @@ def normalize_tg(url: str | None) -> str | None:
     return u
 
 
+
+def looks_like_ca(s: str) -> bool:
+    s = s.strip()
+    if s.startswith("0x") and len(s) >= 40:
+        return True
+    if ":" in s and not s.startswith("http"):
+        return True
+    # solana-ish base58 length
+    if 32 <= len(s) <= 50 and s.isalnum():
+        return True
+    return False
+
+
+def looks_like_x(s: str) -> bool:
+    s = s.strip()
+    return bool(
+        s.startswith("@")
+        or "x.com/" in s.lower()
+        or "twitter.com/" in s.lower()
+    )
+
+
+def looks_like_tg(s: str) -> bool:
+    return "t.me/" in s.lower() or s.strip().startswith("@") and False  # @ is X default
+
+
+def looks_like_url(s: str) -> bool:
+    return s.strip().startswith("http://") or s.strip().startswith("https://")
+
+
+async def resolve_or_create_from_query(
+    db: DB, client: httpx.AsyncClient, owner_id: int, query: str
+) -> dict[str, Any] | None:
+    """Accept website / X / TG / CA — find saved project or create a working draft."""
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    # numeric id still works for saved projects
+    if q.isdigit():
+        p = await db.by_id(int(q))
+        if p:
+            return p
+
+    # try name match on saved
+    found = await db.find(owner_id, q)
+    if found and not looks_like_url(q) and not looks_like_x(q) and not looks_like_ca(q):
+        return found
+
+    data: dict[str, Any] = {"name": "Untitled project"}
+    chain = None
+    addr = None
+
+    if looks_like_x(q):
+        h = normalize_x(q)
+        data["x_handle"] = h
+        data["name"] = f"@{h}" if h else "X project"
+    elif "t.me/" in q.lower():
+        data["telegram"] = normalize_tg(q)
+        slug = q.rstrip("/").split("/")[-1]
+        data["name"] = f"TG:{slug}"
+    elif looks_like_url(q):
+        data["website"] = q
+        # rough name from host
+        host = q.split("//")[-1].split("/")[0].replace("www.", "")
+        data["name"] = host
+    elif looks_like_ca(q):
+        if ":" in q:
+            chain, addr = q.split(":", 1)
+            chain, addr = chain.lower().strip(), addr.strip()
+        else:
+            addr = q
+            chain = "ethereum" if addr.startswith("0x") else "solana"
+        data["chain"] = chain
+        data["contract_address"] = addr
+        data["name"] = f"{chain}:{addr[:8]}…"
+        # try DexScreener for name + socials
+        try:
+            if chain and addr:
+                pairs = await http_get(client, f"https://api.dexscreener.com/tokens/v1/{chain}/{addr}")
+                if isinstance(pairs, list) and pairs:
+                    pair = pairs[0]
+                    base = pair.get("baseToken") or {}
+                    data["name"] = base.get("name") or data["name"]
+                    data["ticker"] = base.get("symbol")
+                    info = pair.get("info") or {}
+                    for link in info.get("socials") or []:
+                        if not isinstance(link, dict):
+                            continue
+                        u = (link.get("url") or "").strip()
+                        t = (link.get("type") or "").lower()
+                        if "twitter" in t or "x.com" in u:
+                            data["x_handle"] = normalize_x(u)
+                        elif "telegram" in t or "t.me" in u:
+                            data["telegram"] = normalize_tg(u)
+                    for link in info.get("websites") or []:
+                        if isinstance(link, dict) and link.get("url"):
+                            data["website"] = link["url"]
+                            break
+                    if pair.get("url") and not data.get("website"):
+                        pass
+        except Exception as exc:
+            log.warning("dex resolve: %s", exp if False else exc)
+    else:
+        # treat as name search only
+        if found:
+            return found
+        data["name"] = q
+
+    # match existing by x / website / tg / ca
+    rows = await db.list_projects(owner_id, limit=100)
+    for p in rows:
+        if data.get("x_handle") and normalize_x(p.get("x_handle")) == normalize_x(data.get("x_handle")):
+            return p
+        if data.get("website") and (p.get("website") or "").rstrip("/") == data["website"].rstrip("/"):
+            return p
+        if data.get("telegram") and (p.get("telegram") or "") == data["telegram"]:
+            return p
+        if data.get("contract_address") and (p.get("contract_address") or "").lower() == data["contract_address"].lower():
+            if not data.get("chain") or (p.get("chain") or "").lower() == (data.get("chain") or "").lower():
+                return p
+
+    pid = await db.add_project(owner_id, data)
+    social = await gather_social(client, data)
+    about = (social.get("website") or {}).get("about")
+    updates = {"social_json": __import__("json").dumps(social), "last_social_at": now()}
+    if about:
+        updates["description"] = about
+    # improve name from site title
+    title = (social.get("website") or {}).get("title") or (social.get("telegram") or {}).get("title")
+    if title:
+        weak = (
+            data["name"].startswith("http")
+            or data["name"].startswith("@")
+            or data["name"].startswith("TG:")
+            or data["name"].startswith("Untitled")
+            or "…" in data["name"]
+        )
+        if weak:
+            updates["name"] = title[:80]
+    await db.update_project(pid, **updates)
+    return await db.by_id(pid)
+
+
 async def fetch_website_brief(client: httpx.AsyncClient, url: str | None) -> dict[str, Any]:
     out: dict[str, Any] = {"url": url, "title": None, "about": None, "ok": False}
     if not url or not url.startswith("http"):
@@ -624,9 +757,9 @@ def deps(context: ContextTypes.DEFAULT_TYPE) -> tuple[DB, httpx.AsyncClient]:
 async def resolve_project(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str | None) -> dict[str, Any] | None:
     if not arg:
         return None
-    db, _ = deps(context)
+    db, client = deps(context)
     uid = update.effective_user.id if update.effective_user else 0
-    return await db.find(uid, arg)
+    return await resolve_or_create_from_query(db, client, uid, arg)
 
 
 # ---------- handlers ----------
@@ -639,9 +772,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_html(
         "🐦 <b>Social + Content Intelligence online</b>\n\n"
-        "Add a project you want to analyze, then run /social or /ideas.\n"
-        "This bot is separate from Project Scout.\n\n"
-        "/addproject — add one\n/help — full command map"
+        "Paste a link or CA — no id needed:\n"
+        "/social https://x.com/handle\n"
+        "/social https://t.me/group\n"
+        "/social https://project.site\n"
+        "/social base:0x…\n\n"
+        "/ideas · /write · /contentgaps work the same way.\n"
+        "/addproject is optional (save for watchlist).\n"
+        "/status — check AI keys"
     )
 
 
@@ -654,13 +792,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
+    g = env("GROQ_API_KEY")
+    o = env("OPENROUTER_API_KEY")
     lines = [
         "📡 <b>Status</b>",
-        f"Groq: {'set' if env('GROQ_API_KEY') else 'not set'} · {esc(KEY_STATUS.get('groq') or 'not tried')}",
-        f"OpenRouter: {'set' if env('OPENROUTER_API_KEY') else 'not set'} · {esc(KEY_STATUS.get('openrouter') or 'not tried')}",
-        f"Gemini: {'set' if env('GEMINI_API_KEY') else 'not set'} · {esc(KEY_STATUS.get('gemini') or 'not tried')}",
-        f"X bearer: {'set' if env('X_BEARER_TOKEN') else 'not set'}",
+        f"Groq key in env: <b>{'YES' if g else 'NO'}</b> · last try: {esc(KEY_STATUS.get('groq') or 'not tried yet')}",
+        f"OpenRouter key in env: <b>{'YES' if o else 'NO'}</b> · last try: {esc(KEY_STATUS.get('openrouter') or 'not tried yet')}",
+        f"Gemini: {'YES' if env('GEMINI_API_KEY') else 'NO'} · {esc(KEY_STATUS.get('gemini') or '—')}",
+        f"X bearer: {'YES' if env('X_BEARER_TOKEN') else 'NO'}",
         f"DB: {esc(os.getenv('DATABASE_PATH', './social.db'))}",
+        "",
+        "If keys say NO: put them on <b>this</b> Railway service (Social bot), not Scout, then redeploy.",
+        "If YES but AI offline: open /ideas once to force a try, then /status again.",
     ]
     await update.effective_message.reply_html("\n".join(lines))
 
@@ -725,9 +868,11 @@ async def cmd_addproject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     context.user_data["add_flow"] = {"step": "name", "data": {}}
     await update.effective_message.reply_text(
-        "Add project — send the project name.\n(Or cancel with /cancel)\n\n"
-        "You can also one-shot:\n"
-        "/addproject Name | @xhandle | https://site | https://t.me/group | chain | 0xCA"
+        "Optional: save a project for /watchlist.\n"
+        "Or skip this — just run /social with a link.\n\n"
+        "Guided: send the project name (or /cancel).\n"
+        "One-shot:\n"
+        "/addproject Name | @x | https://site | https://t.me/… | chain | CA"
     )
 
 
@@ -845,7 +990,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /project <id|name>")
+        await update.effective_message.reply_text("Usage: /project <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -897,11 +1042,11 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /social <id|name>")
+        await update.effective_message.reply_text("Usage: /social <website|@x|t.me/…|CA|chain:CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
-        await update.effective_message.reply_text("Not found. /addproject first.")
+        await update.effective_message.reply_text("Could not resolve that link/CA.")
         return
     await update.effective_message.reply_text("Gathering public social signals…")
     db, client = deps(context)
@@ -956,7 +1101,7 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     args = context.args or []
     if not args:
-        await update.effective_message.reply_text("Usage: /activity <id|name> [24h|7d|30d]")
+        await update.effective_message.reply_text("Usage: /activity <website|@x|tg|CA> [24h|7d|30d]")
         return
     window = "7d"
     if args[-1] in {"24h", "7d", "30d"}:
@@ -987,7 +1132,7 @@ async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /ideas <id|name>")
+        await update.effective_message.reply_text("Usage: /ideas <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1016,7 +1161,7 @@ async def cmd_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
         await update.effective_message.reply_text(
-            "Usage: /write <id|name> [x|thread|tg|edu|community|announce]"
+            "Usage: /write <website|@x|tg|CA> [x|thread|tg|edu|community|announce]"
         )
         return
     kind = "x"
@@ -1050,7 +1195,7 @@ async def cmd_thread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     args = context.args or []
     if len(args) < 2:
-        await update.effective_message.reply_text("Usage: /thread <id|name> <topic>")
+        await update.effective_message.reply_text("Usage: /thread <website|@x|CA> <topic>")
         return
     # first token id/name — rest topic. If id is multi-word name, user should use id.
     p = await resolve_project(update, context, args[0])
@@ -1081,7 +1226,7 @@ async def cmd_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /rewrite <id|name>  then paste the text")
+        await update.effective_message.reply_text("Usage: /rewrite <website|@x|CA>  then paste the text")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1097,7 +1242,7 @@ async def cmd_contentgaps(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /contentgaps <id|name>")
+        await update.effective_message.reply_text("Usage: /contentgaps <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1126,7 +1271,7 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     args = context.args or []
     if len(args) < 2:
-        await update.effective_message.reply_text("Usage: /announce <id|name> <what happened>")
+        await update.effective_message.reply_text("Usage: /announce <website|@x|CA> <what happened>")
         return
     p = await resolve_project(update, context, args[0])
     what = " ".join(args[1:])
@@ -1153,7 +1298,7 @@ async def cmd_communitycontent(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /communitycontent <id|name>")
+        await update.effective_message.reply_text("Usage: /communitycontent <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1228,7 +1373,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /daily <id|name>")
+        await update.effective_message.reply_text("Usage: /daily <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1252,7 +1397,7 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /audit <id|name>")
+        await update.effective_message.reply_text("Usage: /audit <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
@@ -1275,7 +1420,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message or not update.effective_user:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /watch <id|name>")
+        await update.effective_message.reply_text("Usage: /watch <website|@x|tg|CA>")
         return
     p = await resolve_project(update, context, " ".join(context.args))
     if not p:
