@@ -17,7 +17,7 @@ from urllib.parse import unquote
 import aiosqlite
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 );
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
+
+SCOUT_BUILD = "2026-09-23-risks-mcap-tg-v1"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -2977,6 +2979,33 @@ async def note_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def on_start(app: Application) -> None:
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Start Scout"),
+                BotCommand("help", "Command list"),
+                BotCommand("newtokens", "New projects catch-up"),
+                BotCommand("project", "Full report by CA or id"),
+                BotCommand("jobs", "Opportunity shortlist"),
+                BotCommand("digest", "Top picks window"),
+                BotCommand("approach", "Persona openers"),
+                BotCommand("ask", "Ask AI about a project"),
+                BotCommand("gaps", "Gaps (meme or utility aware)"),
+                BotCommand("risks", "On-chain + web + X risks"),
+                BotCommand("watch", "Watch CA until socials"),
+                BotCommand("unwatch", "Remove from watchlist"),
+                BotCommand("watchlist", "Your watches"),
+                BotCommand("cg", "CoinGecko listings"),
+                BotCommand("cmc", "CMC new listings"),
+                BotCommand("early", "Early / thin liquidity"),
+                BotCommand("alerts", "alerts on|off"),
+                BotCommand("status", "Scanner + keys status"),
+            ]
+        )
+        log.info("Telegram command menu registered")
+    except Exception as exc:
+        log.warning("set_my_commands failed: %s", exc)
+
     db: DB = app.bot_data["db"]
     await db.connect()
     app.bot_data["http"] = httpx.AsyncClient(headers={"User-Agent": "Web3ProjectScout/1.0"}, timeout=25)
