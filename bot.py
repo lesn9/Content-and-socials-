@@ -44,10 +44,14 @@ log = logging.getLogger("social-content")
 
 def env(*names: str, default: str = "") -> str:
     for n in names:
-        v = (os.getenv(n) or "").strip()
+        v = (os.getenv(n) or "").strip().strip('"').strip("'")
         if v:
             return v
     return default
+
+
+def env_present(*names: str) -> bool:
+    return bool(env(*names))
 
 
 def now() -> int:
@@ -93,10 +97,15 @@ Same pattern for:
 /projects — saved list
 /watch · /watchlist
 
-<b>System</b>
-/status · /help
+<b>V2 intelligence</b>
+/audience · /narratives · /topcontent · /contentpatterns
+/mentions · /weekly · /calendar · /repurpose
 
-Works with whatever is available (X only, TG only, site only, or CA only).
+<b>System</b>
+/status · /testai · /help
+
+Works with website, X, TG, or CA — any one is enough.
+If AI fails: /testai shows the exact provider error.
 """
 
 # ---------- DB ----------
@@ -291,83 +300,114 @@ KEY_STATUS: dict[str, str] = {}
 
 
 async def llm_write(prompt: str, system: str | None = None) -> str:
-    """Free-first: Groq → OpenRouter → Gemini → xAI."""
+    """Free-first: Groq → OpenRouter → Gemini → xAI/OpenAI. Stores errors in KEY_STATUS."""
     sys_msg = system or (
         "You are a Web3 social & content strategist. Be specific to the project. "
         "Never invent product facts not given in the prompt. No investment advice. "
         "Plain text, scannable bullets when useful."
     )
-    providers = []
-    groq = env("GROQ_API_KEY")
-    if groq:
-        providers.append(
-            ("groq", groq, "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile")
-        )
-    ork = env("OPENROUTER_API_KEY")
-    if ork:
-        providers.append(
-            (
-                "openrouter",
-                ork,
-                "https://openrouter.ai/api/v1/chat/completions",
-                "meta-llama/llama-3.3-70b-instruct:free",
-            )
-        )
-    gem = env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    xai = env("XAI_API_KEY")
+    # Support common Railway naming mistakes
+    groq = env("GROQ_API_KEY", "GROQ_KEY", "GROQ")
+    ork = env("OPENROUTER_API_KEY", "OPENROUTER_KEY", "OPEN_ROUTER_API_KEY")
+    gem = env("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY")
+    xai = env("XAI_API_KEY", "GROK_API_KEY")
     oai = env("OPENAI_API_KEY")
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        for name, key, url, model in providers:
+    attempts: list[tuple[str, str, str, str]] = []
+    # name, key, url, model
+    if groq:
+        for model in (
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
+            "llama-3.1-8b-instant",
+            "gemma2-9b-it",
+        ):
+            attempts.append(("groq", groq, "https://api.groq.com/openai/v1/chat/completions", model))
+    if ork:
+        for model in (
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemini-2.0-flash-exp:free",
+            "openai/gpt-4o-mini",
+            "meta-llama/llama-3.1-8b-instruct:free",
+        ):
+            attempts.append(
+                ("openrouter", ork, "https://openrouter.ai/api/v1/chat/completions", model)
+            )
+
+    async with httpx.AsyncClient(timeout=75) as client:
+        for name, key, url, model in attempts:
             try:
+                headers = {
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                }
+                if name == "openrouter":
+                    headers["HTTP-Referer"] = "https://railway.app"
+                    headers["X-Title"] = "SocialContentBot"
                 r = await client.post(
                     url,
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    headers=headers,
                     json={
                         "model": model,
                         "messages": [
                             {"role": "system", "content": sys_msg},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": prompt[:12000]},
                         ],
                         "temperature": 0.7,
                     },
                 )
+                body_snip = (r.text or "")[:180].replace("\n", " ")
                 if r.status_code >= 400:
-                    KEY_STATUS[name] = f"http {r.status_code}"
+                    KEY_STATUS[name] = f"http {r.status_code}: {body_snip}"
+                    log.warning("%s %s -> %s %s", name, model, r.status_code, body_snip)
                     continue
                 data = r.json()
-                text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                text = (
+                    (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                ).strip()
                 if text:
                     KEY_STATUS[name] = f"ok:{model}"
                     return text
+                KEY_STATUS[name] = f"empty response:{model}"
             except Exception as exc:
-                KEY_STATUS[name] = str(exc)[:80]
-                log.warning("%s failed: %s", name, exc)
+                KEY_STATUS[name] = str(exc)[:120]
+                log.warning("%s failed: %s", name, exp if False else exc)
 
         if gem:
-            try:
-                model = "gemini-2.0-flash"
-                r = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    params={"key": gem},
-                    json={"contents": [{"parts": [{"text": sys_msg + "\n\n" + prompt}]}]},
-                )
-                if r.status_code < 400:
+            for model in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"):
+                try:
+                    r = await client.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        params={"key": gem},
+                        json={
+                            "contents": [
+                                {"parts": [{"text": (sys_msg + "\n\n" + prompt)[:14000]}]}
+                            ]
+                        },
+                    )
+                    if r.status_code >= 400:
+                        KEY_STATUS["gemini"] = f"http {r.status_code}: {(r.text or '')[:120]}"
+                        continue
                     data = r.json()
-                    parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+                    parts = (
+                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    )
                     text = "\n".join(p.get("text") or "" for p in parts).strip()
                     if text:
                         KEY_STATUS["gemini"] = f"ok:{model}"
                         return text
-                else:
-                    KEY_STATUS["gemini"] = f"http {r.status_code}"
-            except Exception as exc:
-                KEY_STATUS["gemini"] = str(exc)[:80]
+                except Exception as exc:
+                    KEY_STATUS["gemini"] = str(exc)[:120]
 
         if xai or oai:
             key = xai or oai
-            base = "https://api.x.ai/v1/chat/completions" if xai else "https://api.openai.com/v1/chat/completions"
+            base = (
+                "https://api.x.ai/v1/chat/completions"
+                if xai
+                else "https://api.openai.com/v1/chat/completions"
+            )
             model = "grok-2-latest" if xai else "gpt-4o-mini"
+            tag = "xai" if xai else "openai"
             try:
                 r = await client.post(
                     base,
@@ -376,21 +416,55 @@ async def llm_write(prompt: str, system: str | None = None) -> str:
                         "model": model,
                         "messages": [
                             {"role": "system", "content": sys_msg},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": prompt[:12000]},
                         ],
                     },
                 )
                 if r.status_code < 400:
                     data = r.json()
-                    text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                    text = (
+                        (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                    ).strip()
                     if text:
-                        KEY_STATUS["xai" if xai else "openai"] = f"ok:{model}"
+                        KEY_STATUS[tag] = f"ok:{model}"
                         return text
-                KEY_STATUS["xai" if xai else "openai"] = f"http {r.status_code}"
+                KEY_STATUS[tag] = f"http {r.status_code}: {(r.text or '')[:120]}"
             except Exception as exc:
-                KEY_STATUS["xai" if xai else "openai"] = str(exc)[:80]
+                KEY_STATUS[tag] = str(exc)[:120]
 
+    if not any([groq, ork, gem, xai, oai]):
+        KEY_STATUS["env"] = "NO_KEYS_VISIBLE — check this service Variables, not Scout"
     return ""
+
+
+async def cmd_testai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-test AI keys and show exact error."""
+    if not await gate(update, context) or not update.effective_message:
+        return
+    await update.effective_message.reply_text("Testing AI providers…")
+    text = await llm_write("Reply with exactly: AI_OK and one short sentence about Web3 content.")
+    g = env("GROQ_API_KEY", "GROQ_KEY", "GROQ")
+    o = env("OPENROUTER_API_KEY", "OPENROUTER_KEY", "OPEN_ROUTER_API_KEY")
+    lines = [
+        "🧪 <b>AI TEST</b>",
+        f"GROQ_API_KEY visible: <b>{'YES' if g else 'NO'}</b> (len={len(g)})",
+        f"OPENROUTER_API_KEY visible: <b>{'YES' if o else 'NO'}</b> (len={len(o)})",
+        f"Gemini: {'YES' if env('GEMINI_API_KEY') else 'NO'}",
+        "",
+        "Provider status:",
+    ]
+    for k, v in KEY_STATUS.items():
+        lines.append(f"• {esc(k)}: {esc(v)}")
+    if text:
+        lines += ["", "✅ Model reply:", esc(text[:500])]
+    else:
+        lines += [
+            "",
+            "❌ No provider returned text.",
+            "Same Railway <b>project</b> is fine — keys must be on <b>this service</b> Variables.",
+            "After adding vars: Redeploy / Restart the Social service.",
+        ]
+    await update.effective_message.reply_html("\n".join(lines))
 
 
 # ---------- fetch helpers ----------
@@ -626,7 +700,7 @@ async def fetch_tg_brief(client: httpx.AsyncClient, url: str | None) -> dict[str
 
 
 async def fetch_x_brief(client: httpx.AsyncClient, handle: str | None) -> dict[str, Any]:
-    """Best-effort: official API if bearer present, else note unavailable."""
+    """Official API if bearer set; else best-effort public page scrape."""
     out: dict[str, Any] = {
         "handle": handle,
         "followers": None,
@@ -635,34 +709,62 @@ async def fetch_x_brief(client: httpx.AsyncClient, handle: str | None) -> dict[s
         "bio": None,
         "ok": False,
         "note": None,
+        "recent": [],
     }
     h = normalize_x(handle)
     if not h:
         return out
     out["handle"] = h
     bearer = env("X_BEARER_TOKEN")
-    if not bearer:
-        out["note"] = "X API not configured — set X_BEARER_TOKEN for live metrics"
-        return out
-    try:
-        r = await client.get(
-            f"https://api.x.com/2/users/by/username/{h}",
-            params={"user.fields": "public_metrics,description"},
-            headers={"Authorization": f"Bearer {bearer}"},
-            timeout=20,
-        )
-        if r.status_code >= 400:
+    if bearer:
+        try:
+            r = await client.get(
+                f"https://api.x.com/2/users/by/username/{h}",
+                params={"user.fields": "public_metrics,description"},
+                headers={"Authorization": f"Bearer {bearer}"},
+                timeout=20,
+            )
+            if r.status_code < 400:
+                data = (r.json().get("data") or {})
+                metrics = data.get("public_metrics") or {}
+                out["followers"] = metrics.get("followers_count")
+                out["following"] = metrics.get("following_count")
+                out["posts"] = metrics.get("tweet_count")
+                out["bio"] = data.get("description")
+                out["ok"] = True
+                return out
             out["note"] = f"X API http {r.status_code}"
-            return out
-        data = (r.json().get("data") or {})
-        metrics = data.get("public_metrics") or {}
-        out["followers"] = metrics.get("followers_count")
-        out["following"] = metrics.get("following_count")
-        out["posts"] = metrics.get("tweet_count")
-        out["bio"] = data.get("description")
-        out["ok"] = True
+        except Exception as e:
+            out["note"] = str(e)[:100]
+
+    # Public HTML fallback (fragile, best-effort)
+    try:
+        html = await http_get(
+            client,
+            f"https://x.com/{h}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; SocialContentBot/2.0)",
+                "Accept": "text/html",
+            },
+        )
+        if isinstance(html, str) and len(html) > 500:
+            # og:description often has bio
+            m = re.search(
+                r'property="og:description"\s+content="([^"]+)"', html
+            ) or re.search(r'content="([^"]+)"\s+property="og:description"', html)
+            if m:
+                out["bio"] = m.group(1)[:300]
+                out["ok"] = True
+            m2 = re.search(r'"description":"([^"]{10,200})"', html)
+            if m2 and not out.get("bio"):
+                out["bio"] = m2.group(1).encode().decode("unicode_escape", errors="ignore")[:300]
+                out["ok"] = True
+            if not out.get("note"):
+                out["note"] = "Public page fallback (limited without X_BEARER_TOKEN)"
     except Exception as e:
-        out["note"] = str(e)[:100]
+        out["note"] = (out.get("note") or "") + f" scrape:{str(e)[:60]}"
+    if not out["ok"] and not out.get("note"):
+        out["note"] = "X data limited without X_BEARER_TOKEN"
     return out
 
 
@@ -893,6 +995,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text or text.startswith("/"):
         return
 
+    # repurpose paste flow
+    if context.user_data.get("repurpose_pid"):
+        pid = int(context.user_data.pop("repurpose_pid"))
+        db, client = deps(context)
+        p = await db.by_id(pid)
+        if not p:
+            await update.effective_message.reply_text("Project gone.")
+            return
+        social = await gather_social(client, p)
+        prompt = (
+            project_context(p, social)
+            + "\n\nSOURCE CONTENT:\n"
+            + text
+            + "\n\nRepurpose into: 1) X post 2) X thread outline 3) Telegram post "
+            + "4) Discord note 5) FAQ bullets 6) 3 follow-up content ideas."
+        )
+        await update.effective_message.reply_text("Repurposing...")
+        out = await llm_write(prompt)
+        await update.effective_message.reply_html(
+            "♻️ <b>REPURPOSE · "
+            + esc(p["name"])
+            + "</b>\n\n"
+            + esc(out or _ai_fail())
+        )
+        return
+
     # rewrite paste flow
     if context.user_data.get("rewrite_pid"):
         pid = int(context.user_data.pop("rewrite_pid"))
@@ -1092,7 +1220,7 @@ async def cmd_social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if analysis:
         lines.append(esc(analysis))
     else:
-        lines.append("⚠️ AI offline — raw public data only. Set GROQ_API_KEY.")
+        lines.append("⚠️ " + esc(_ai_fail()))
     await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -1528,6 +1656,205 @@ async def on_stop_app(app: Application) -> None:
         await db.close()
 
 
+
+async def cmd_narratives(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /narratives <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "NARRATIVE TRACKER. Sections:\n"
+        "PROJECT NARRATIVES (what they seem to push)\n"
+        "COMMUNITY NARRATIVES (likely questions/themes from public about text)\n"
+        "EXTERNAL / MARKET NARRATIVES (relevant crypto themes)\n"
+        "CONTENT INTERSECTION (1-2 angles)\n"
+        "Mark analysis vs fact. No price talk."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"🔥 <b>NARRATIVES · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_audience(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /audience <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "AUDIENCE INTELLIGENCE from public signals only:\n"
+        "Themes · Questions · Concerns · Interests · Sophistication (guess labeled as analysis)\n"
+        "Do not invent demographics."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"👥 <b>AUDIENCE · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_topcontent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /topcontent <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "Without live engagement metrics, infer likely TOP CONTENT angles for this project "
+        "and what usually works for similar products. Label clearly as strategy inference, not measured stats.\n"
+        "3 formats with: topic, format, why it may work, suggested hook."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"🔥 <b>TOP CONTENT ANGLES · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_contentpatterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /contentpatterns <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "CONTENT PATTERNS report:\nStrong topics · Strong formats · Likely audience responses · "
+        "Low-engagement patterns to avoid · Posting cadence suggestion\n"
+        "Base on project type + public copy; say when data is thin."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"🧠 <b>CONTENT PATTERNS · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /mentions <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "MENTION / CONVERSATION intelligence (inferred from public positioning, not a live mention crawl):\n"
+        "Likely positive themes · Neutral · Concerns · Questions\n"
+        "State clearly this is inference until X search is configured."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"🗣 <b>MENTIONS (inferred) · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /weekly <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "WEEKLY REPORT outline for a community operator:\n"
+        "Social snapshot · Activity · Top content ideas · Weak spots · "
+        "Community questions · Narratives · Content gaps · Next week plan (5 bullets)"
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"🗓 <b>WEEKLY · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /calendar <website|@x|tg|CA>")
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    _, client = deps(context)
+    social = await gather_social(client, p)
+    prompt = (
+        f"{project_context(p, social)}\n\n"
+        "7-day CONTENT CALENDAR (Mon-Sun). Each day: theme + 1 specific post idea for THIS project. "
+        "Not generic crypto filler."
+    )
+    out = await llm_write(prompt)
+    await update.effective_message.reply_html(
+        f"📅 <b>CALENDAR · {esc(p['name'])}</b>\n\n{esc(out or _ai_fail())}"
+    )
+
+
+async def cmd_repurpose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /repurpose <website|@x|CA>\nThen paste the blog/announcement/thread text."
+        )
+        return
+    p = await resolve_project(update, context, " ".join(context.args))
+    if not p:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    context.user_data["repurpose_pid"] = p["id"]
+    await update.effective_message.reply_text(
+        f"Paste the source content to repurpose for {p['name']}.\n(/cancel to abort)"
+    )
+
+
+def _ai_fail() -> str:
+    bits = [f"{k}: {v}" for k, v in KEY_STATUS.items()] or ["no attempt recorded"]
+    return (
+        "AI offline.\n"
+        + "\n".join(bits)
+        + "\n\nRun /testai — keys must be on THIS Railway service, then Redeploy."
+    )
+
+
+
 def main() -> None:
     token = env("TELEGRAM_BOT_TOKEN", "SOCIAL_BOT_TOKEN")
     if not token:
@@ -1564,6 +1891,18 @@ def main() -> None:
         ("unwatch", cmd_unwatch),
         ("watchlist", cmd_watchlist),
     ]
+    v2 = [
+        ("narratives", cmd_narratives),
+        ("audience", cmd_audience),
+        ("topcontent", cmd_topcontent),
+        ("contentpatterns", cmd_contentpatterns),
+        ("mentions", cmd_mentions),
+        ("weekly", cmd_weekly),
+        ("calendar", cmd_calendar),
+        ("repurpose", cmd_repurpose),
+        ("testai", cmd_testai),
+    ]
+    cmds.extend(v2)
     for name, fn in cmds:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_callback))
